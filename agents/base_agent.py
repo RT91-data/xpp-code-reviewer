@@ -7,173 +7,146 @@ Each agent:
   2. Calls Claude with a specialist prompt
   3. Returns a list of Issue dicts
 
-Design notes (why this version differs from the naive regex approach):
+Design notes (v2 -- tool-use instead of free-text JSON):
 
-- JSON extraction is done with a hand-rolled bracket matcher that tracks
-  whether we're inside a string literal (respecting backslash escapes).
-  A plain greedy brace regex is greedy across the whole response and breaks in two
-  ways: (a) if the model's X++ code snippets contain braces, matching
-  is still fine since we track string state, and (b) if the response is
-  truncated mid-object (no closing brace at all), the old regex simply
-  fails to match and the function silently returns [] -- which looks
-  identical to "no issues found". That's a dangerous silent failure,
-  especially for the security agent. This version raises instead.
+Earlier versions asked Claude to emit JSON as free text, then parsed it
+after the fact with regex + a hand-rolled bracket matcher + a control-
+character sanitizer. That entire defensive layer existed because
+free-text generation gives the model no structural guarantee -- it can
+emit an unescaped newline inside a string, get truncated mid-object,
+etc, and none of that is knowable until you try (and fail) to parse it.
 
-- Control characters (raw newline/tab/CR) that a model emits *inside*
-  a JSON string value are illegal per the JSON spec and make
-  json.loads() throw immediately. We only escape them when we are
-  actually inside a string, so we never touch structural whitespace
-  between key/value pairs.
+This version uses Claude's tool-use API instead: we hand the model a
+JSON Schema up front (ISSUE_TOOL) and force it to call that tool via
+tool_choice. The API validates the arguments against the schema before
+they ever reach us -- response.content contains a tool_use block whose
+.input is already a parsed Python dict, not a string we need to parse
+ourselves. This doesn't just clean up the code, it removes the bug
+class: there is no "raw newline broke json.loads" failure mode left,
+because we never call json.loads on model output at all.
 
-- stop_reason is checked explicitly. If Claude stopped because it hit
-  max_tokens, we know *why* JSON might be incomplete rather than
-  guessing from a parse error alone.
+What this does NOT fix: truncation. A very long suggested_fix can still
+hit max_tokens mid-generation, which can produce an incomplete tool_use
+block. We still check response.stop_reason and still raise rather than
+silently returning partial/empty data -- the philosophy from v1 (an
+empty issue list must always mean "genuinely found nothing," never
+"something went wrong and got hidden") is unchanged, only the mechanism
+for detecting the problem is simpler now.
 """
 
-import json
 import os
 from anthropic import Anthropic
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 MODEL = "claude-sonnet-4-6"
-
-# Bumped from 4096. Suggested_fix snippets for classes with several
-# flagged methods can easily exceed the old ceiling. If you still see
-# truncation on large classes, the real fix is chunking the class by
-# method rather than raising this further indefinitely.
 MAX_TOKENS = 8192
 
-ISSUE_SCHEMA = """
-Return a JSON object with this exact structure:
-{
-  "issues": [
-    {
-      "severity": "Critical|Major|Minor|Info",
-      "category": "string",
-      "method": "method name or 'Class-level'",
-      "line_hint": "approximate line number or range e.g. '45' or '45-52'",
-      "title": "short title (under 80 chars)",
-      "description": "what the issue is",
-      "consequence": "what can go wrong if not fixed",
-      "steps_to_replicate": "how to trigger or demonstrate the issue",
-      "suggested_fix": "corrected X++ code snippet or clear instructions"
-    }
-  ]
+# JSON Schema for a single issue. Used both to build the tool definition
+# below and as the source of truth other agents can import if they need
+# to reference field names/types programmatically.
+ISSUE_PROPERTIES = {
+    "severity": {
+        "type": "string",
+        "enum": ["Critical", "Major", "Minor", "Info"],
+        "description": "Severity of the finding.",
+    },
+    "category": {
+        "type": "string",
+        "description": "Short category label, e.g. 'SQL Injection', 'N+1 Query'.",
+    },
+    "method": {
+        "type": "string",
+        "description": "Method name the issue occurs in, or 'Class-level' if not method-specific.",
+    },
+    "line_hint": {
+        "type": "string",
+        "description": "Approximate line number or range, e.g. '45' or '45-52'. Empty string if unknown.",
+    },
+    "title": {
+        "type": "string",
+        "description": "Short title, under 80 characters.",
+    },
+    "description": {
+        "type": "string",
+        "description": "What the issue is.",
+    },
+    "consequence": {
+        "type": "string",
+        "description": "What can go wrong if not fixed.",
+    },
+    "steps_to_replicate": {
+        "type": "string",
+        "description": "How to trigger or demonstrate the issue.",
+    },
+    "suggested_fix": {
+        "type": "string",
+        "description": "Corrected X++ code snippet or clear instructions.",
+    },
 }
 
-CRITICAL FORMATTING RULE: any code you place inside a JSON string value
-(e.g. "suggested_fix") MUST have its newlines escaped as the two
-characters backslash-n, NOT a literal line break. The value is a JSON
-string, not a code block.
+ISSUE_REQUIRED = [
+    "severity", "category", "method", "title",
+    "description", "consequence", "steps_to_replicate", "suggested_fix",
+]
 
-If no issues found, return: {"issues": []}
-Return ONLY the JSON object. No preamble, no markdown, no explanation.
+ISSUE_TOOL = {
+    "name": "report_issues",
+    "description": (
+        "Report the list of code review issues found in the X++ class. "
+        "Call this exactly once with every issue found. If no issues were "
+        "found, call it with an empty issues array -- do not skip calling it."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": ISSUE_PROPERTIES,
+                    "required": ISSUE_REQUIRED,
+                },
+            }
+        },
+        "required": ["issues"],
+    },
+}
+
+# Kept for backwards compatibility with any agent system prompt that still
+# references it for human-readable field descriptions. No longer needed
+# for parsing -- the schema above is enforced by the API directly -- but
+# harmless to include in a prompt for extra context on what each field means.
+ISSUE_SCHEMA = """
+Each issue you report should have:
+- severity: Critical, Major, Minor, or Info
+- category: short category label
+- method: method name, or 'Class-level'
+- line_hint: approximate line number or range, e.g. '45' or '45-52'
+- title: short title under 80 characters
+- description: what the issue is
+- consequence: what can go wrong if not fixed
+- steps_to_replicate: how to trigger or demonstrate the issue
+- suggested_fix: corrected X++ code snippet or clear instructions
+
+Report every issue you find by calling the report_issues tool exactly once.
 """
 
 
 class AgentCallError(Exception):
-    """Raised when a Claude call fails or returns unparsable/truncated JSON.
-    Deliberately NOT swallowed inside call_claude -- callers (app.py) already
-    wrap each agent invocation in try/except and surface the message, so
-    raising here turns a silent 'no issues found' into a visible failure."""
+    """Raised when a Claude call fails or is truncated before completion.
+    Deliberately NOT swallowed -- callers (app.py) already wrap each agent
+    invocation in try/except and surface the message, so raising here turns
+    a silent 'no issues found' into a visible failure."""
     pass
-
-
-def _extract_json_object(text: str) -> str:
-    """
-    Find the first balanced {...} object in text, tracking string/escape
-    state so braces inside string values (e.g. X++ code snippets) don't
-    throw off the depth count.
-
-    Returns the substring, or raises AgentCallError if no balanced object
-    is found (this is the truncation case -- there's an opening brace but
-    the response ran out before the matching close).
-    """
-    start = text.find("{")
-    if start == -1:
-        raise AgentCallError("No JSON object found in response (no '{' present).")
-
-    depth = 0
-    in_string = False
-    escape = False
-
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-
-    # We fell off the end without depth returning to 0 -> truncated response.
-    raise AgentCallError(
-        "JSON object was not closed before the response ended "
-        "(likely truncated by max_tokens)."
-    )
-
-
-def _escape_raw_control_chars_in_strings(text: str) -> str:
-    """
-    Walk the text and, ONLY while inside a string literal, replace raw
-    control characters (newline, carriage return, tab) with their
-    escaped JSON equivalents. Structural whitespace outside strings is
-    left untouched.
-    """
-    out = []
-    in_string = False
-    escape = False
-
-    for ch in text:
-        if in_string:
-            if escape:
-                out.append(ch)
-                escape = False
-                continue
-            if ch == "\\":
-                out.append(ch)
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-                out.append(ch)
-                continue
-            if ch == "\n":
-                out.append("\\n")
-                continue
-            if ch == "\r":
-                out.append("\\r")
-                continue
-            if ch == "\t":
-                out.append("\\t")
-                continue
-            out.append(ch)
-        else:
-            if ch == '"':
-                in_string = True
-            out.append(ch)
-
-    return "".join(out)
 
 
 def call_claude(system_prompt: str, user_content: str) -> list[dict]:
     """
-    Calls Claude and parses the structured JSON response.
+    Calls Claude with report_issues forced via tool_choice and returns the
+    parsed issues directly -- no text parsing involved.
 
-    Raises AgentCallError on any unrecoverable failure (truncation,
-    unparsable JSON, API error) rather than returning [] -- an empty
-    issue list must always mean "the model genuinely found nothing",
-    never "something went wrong and we hid it."
+    Raises AgentCallError on API failure or truncation before the tool
+    call completed.
     """
     try:
         response = client.messages.create(
@@ -181,53 +154,27 @@ def call_claude(system_prompt: str, user_content: str) -> list[dict]:
             max_tokens=MAX_TOKENS,
             temperature=0,
             system=system_prompt,
+            tools=[ISSUE_TOOL],
+            tool_choice={"type": "tool", "name": "report_issues"},
             messages=[{"role": "user", "content": user_content}],
         )
     except Exception as e:
         raise AgentCallError(f"Claude API call failed: {e}") from e
 
-    # Concatenate all text blocks -- response.content can contain more
-    # than one block; content[0] alone silently drops data if it doesn't.
-    raw = "".join(block.text for block in response.content if block.type == "text").strip()
-
     if response.stop_reason == "max_tokens":
-        # Don't try to be clever and salvage a partial object here --
-        # surface it. A truncated Security review reporting fewer issues
-        # than actually exist is worse than an agent that visibly failed.
-        print(f"[agent] WARNING: response truncated (stop_reason=max_tokens). "
-              f"Raw length={len(raw)} chars.")
+        raise AgentCallError(
+            "Response was truncated by max_tokens before the tool call "
+            "completed. Increase MAX_TOKENS or reduce the size of the "
+            "class being reviewed in one call."
+        )
 
-    # Strip markdown code fences if present.
-    if raw.startswith("```"):
-        raw = raw.split("```", 2)[1] if raw.count("```") >= 2 else raw
-        raw = raw.replace("json", "", 1).strip() if raw.lower().startswith("json") else raw
+    tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+    if not tool_use_blocks:
+        raise AgentCallError(
+            f"Expected a report_issues tool call but got none. "
+            f"stop_reason={response.stop_reason}"
+        )
 
-    try:
-        json_str = _extract_json_object(raw)
-    except AgentCallError:
-        # Re-raise with the truncation context attached if that's what happened.
-        if response.stop_reason == "max_tokens":
-            raise AgentCallError(
-                "Response was truncated by max_tokens before the JSON object "
-                "closed. Increase MAX_TOKENS or reduce the size of the class "
-                "being reviewed in one call."
-            )
-        raise
-
-    # First attempt: parse as-is.
-    try:
-        data = json.loads(json_str)
-        return data.get("issues", [])
-    except json.JSONDecodeError:
-        pass  # fall through to the cleaner
-
-    # Second attempt: escape raw control chars inside string literals, then retry.
-    try:
-        cleaned = _escape_raw_control_chars_in_strings(json_str)
-        data = json.loads(cleaned)
-        return data.get("issues", [])
-    except json.JSONDecodeError as e:
-        # Log the actual broken text for debugging -- don't swallow it.
-        print(f"[agent] JSON parse error even after cleaning: {e}")
-        print(f"[agent] First 500 chars of offending JSON: {json_str[:500]}")
-        raise AgentCallError(f"Could not parse JSON response even after cleanup: {e}") from e
+    # tool_choice forces exactly one call to report_issues, so take the first.
+    issues = tool_use_blocks[0].input.get("issues", [])
+    return issues
